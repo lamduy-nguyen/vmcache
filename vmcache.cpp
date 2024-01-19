@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 #include <span>
+#include <utility>
 
 #include <errno.h>
 #include <libaio.h>
@@ -22,6 +23,11 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <immintrin.h>
+#include <string_view>
+#include <fstream>
+#include <format>
+
+#include <tbb/concurrent_queue.h>
 
 __thread uint16_t workerThreadId = 0;
 __thread int32_t tpcchistorycounter = 0;
@@ -134,21 +140,26 @@ struct ResidentPageSet {
    static const u64 tombstone = (~0ull)-1;
 
    struct Entry {
-      atomic<u64> pid;
+      u64 offset;
+      u64 map_pid;
    };
 
-   Entry* ht;
+   struct AtomicEntry {
+      std::atomic<Entry> entry;
+   };
+
+   AtomicEntry* ht;
    u64 count;
    u64 mask;
    atomic<u64> clockPos;
 
    ResidentPageSet(u64 maxCount) : count(next_pow2(maxCount * 1.5)), mask(count - 1), clockPos(0) {
-      ht = (Entry*)allocHuge(count * sizeof(Entry));
-      memset((void*)ht, 0xFF, count * sizeof(Entry));
+      ht = (AtomicEntry*)allocHuge(count * sizeof(AtomicEntry));
+      memset((void*)ht, 0xFF, count * sizeof(AtomicEntry));
    }
 
    ~ResidentPageSet() {
-      munmap(ht, count * sizeof(u64));
+      munmap(ht, count * sizeof(AtomicEntry));
    }
 
    u64 next_pow2(u64 x) {
@@ -170,13 +181,12 @@ struct ResidentPageSet {
       return h;
    }
 
-   void insert(u64 pid) {
+   void insert(u64 offset, u64 pid) {
       u64 pos = hash(pid) & mask;
       while (true) {
-         u64 curr = ht[pos].pid.load();
-         assert(curr != pid);
-         if ((curr == empty) || (curr == tombstone))
-            if (ht[pos].pid.compare_exchange_strong(curr, pid))
+         auto curr = ht[pos].entry.load();
+         if ((curr.map_pid == empty) || (curr.map_pid == tombstone))
+            if (ht[pos].entry.compare_exchange_strong(curr, Entry{offset, pid}))
                return;
 
          pos = (pos + 1) & mask;
@@ -186,12 +196,12 @@ struct ResidentPageSet {
    bool remove(u64 pid) {
       u64 pos = hash(pid) & mask;
       while (true) {
-         u64 curr = ht[pos].pid.load();
-         if (curr == empty)
+         auto curr = ht[pos].entry.load();
+         if (curr.map_pid == empty)
             return false;
 
-         if (curr == pid)
-            if (ht[pos].pid.compare_exchange_strong(curr, tombstone))
+         if (curr.map_pid == pid)
+            if (ht[pos].entry.compare_exchange_strong(curr, Entry{0, tombstone}))
                return true;
 
          pos = (pos + 1) & mask;
@@ -207,9 +217,9 @@ struct ResidentPageSet {
       } while (!clockPos.compare_exchange_strong(pos, newPos));
 
       for (u64 i=0; i<batch; i++) {
-         u64 curr = ht[pos].pid.load();
-         if ((curr != tombstone) && (curr != empty))
-            fn(curr);
+         auto curr = ht[pos].entry.load();
+         if ((curr.map_pid != tombstone) && (curr.map_pid != empty))
+            fn(curr.offset, curr.map_pid);
          pos = (pos + 1) & mask;
       }
    }
@@ -267,9 +277,11 @@ struct BufferManager {
    vector<LibaioInterface> libaioInterface;
 
    int blockfd;
+   int memFile;
 
    atomic<u64> physUsedCount;
    ResidentPageSet residentSet;
+   tbb::concurrent_queue<u64> freeOffset;
    atomic<u64> allocCount;
 
    atomic<u64> readCount;
@@ -583,9 +595,13 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
       cerr << "cannot open BLOCK device '" << path << "'" << endl;
       exit(EXIT_FAILURE);
    }
+   memFile = memfd_create("vmcache", 0);
+   auto ret = ftruncate(memFile, physSize);
+   assert(ret == 0);
+
    u64 virtAllocSize = virtSize + (1<<16); // we allocate 64KB extra to prevent segfaults during optimistic reads
 
-   virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+   virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_SHARED, memFile, 0);
    madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
 
    pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
@@ -599,10 +615,14 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
       libaioInterface.emplace_back(LibaioInterface(blockfd, virtMem));
 
    physUsedCount = 0;
-   allocCount = 1; // pid 0 reserved for meta data
+   allocCount = 0;
    readCount = 0;
    writeCount = 0;
    batch = envOr("BATCH", 64);
+
+   // Alloc pid 0: metadata page
+   allocPage();
+   getPageState(0).unlockX();
 
    cerr << "vmcache " << "blk:" << path << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << endl;
 }
@@ -617,14 +637,26 @@ Page* BufferManager::allocPage() {
    physUsedCount++;
    ensureFreePages();
    u64 pid = allocCount++;
+   u64 offset = pid;
+   bool rewire = false;
    if (pid >= virtCount) {
       cerr << "VIRTGB is too low" << endl;
       exit(EXIT_FAILURE);
    }
+   if (offset >= physCount) {
+      rewire = freeOffset.try_pop(offset);
+      assert(rewire);
+   }
    u64 stateAndVersion = getPageState(pid).stateAndVersion;
    bool succ = getPageState(pid).tryLockX(stateAndVersion);
    assert(succ);
-   residentSet.insert(pid);
+   residentSet.insert(offset, pid);
+   //std::cout << "Alloc: " << pid << " " << offset << endl;
+   // rewiring virtMem before accessing it
+   if (rewire) {
+      auto p = mmap(&virtMem[pid], pageSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, memFile, offset * pageSize);
+      assert(p != MAP_FAILED);
+   }
    virtMem[pid].dirty = true;
 
    return virtMem + pid;
@@ -633,8 +665,13 @@ Page* BufferManager::allocPage() {
 void BufferManager::handleFault(PID pid) {
    physUsedCount++;
    ensureFreePages();
+   u64 offset;
+   auto flag = freeOffset.try_pop(offset);
+   assert(flag);
+   residentSet.insert(offset, pid);
+   //std::cout << "handleFault: " << pid << " " << offset << endl;
+   mmap(&virtMem[pid], pageSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, memFile, offset * pageSize);
    readPage(pid);
-   residentSet.insert(pid);
 }
 
 Page* BufferManager::fixX(PID pid) {
@@ -697,23 +734,27 @@ void BufferManager::readPage(PID pid) {
 }
 
 void BufferManager::evict() {
-   vector<PID> toEvict;
+   vector<pair<PID, u64>> toEvict;
    toEvict.reserve(batch);
    vector<PID> toWrite;
+   vector<u64> writeOffset;
    toWrite.reserve(batch);
+   writeOffset.reserve(batch);
 
    // 0. find candidates, lock dirty ones in shared mode
    while (toEvict.size()+toWrite.size() < batch) {
-      residentSet.iterateClockBatch(batch, [&](PID pid) {
+      residentSet.iterateClockBatch(batch, [&](u64 offset, PID pid) {
          PageState& ps = getPageState(pid);
          u64 v = ps.stateAndVersion;
          switch (PageState::getState(v)) {
             case PageState::Marked:
                if (virtMem[pid].dirty) {
-                  if (ps.tryLockS(v))
-                     toWrite.push_back(pid);
+                  if (ps.tryLockS(v)) {
+                     toWrite.emplace_back(pid);
+                     writeOffset.emplace_back(offset);
+                  }
                } else {
-                  toEvict.push_back(pid);
+                  toEvict.emplace_back(pid, offset);
                }
                break;
             case PageState::Unlocked:
@@ -730,30 +771,32 @@ void BufferManager::evict() {
    writeCount += toWrite.size();
 
    // 2. try to lock clean page candidates
-   toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](PID pid) {
-      PageState& ps = getPageState(pid);
+   toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](auto &entry) {
+      PageState& ps = getPageState(entry.first);
       u64 v = ps.stateAndVersion;
       return (PageState::getState(v) != PageState::Marked) || !ps.tryLockX(v);
    }), toEvict.end());
 
    // 3. try to upgrade lock for dirty page candidates
-   for (auto& pid : toWrite) {
+   for (auto idx = 0; idx < toWrite.size(); idx++) {
+      auto &pid = toWrite[idx];
       PageState& ps = getPageState(pid);
       u64 v = ps.stateAndVersion;
       if ((PageState::getState(v) == 1) && ps.stateAndVersion.compare_exchange_weak(v, PageState::sameVersion(v, PageState::Locked)))
-         toEvict.push_back(pid);
+         toEvict.emplace_back(pid, writeOffset[idx]);
       else
          ps.unlockS();
    }
 
    // 4. remove from page table
-   for (u64& pid : toEvict)
-      madvise(virtMem + pid, pageSize, MADV_DONTNEED);
+   // for (u64& pid : toEvict)
+   //    madvise(virtMem + pid, pageSize, MADV_DONTNEED);
 
    // 5. remove from hash table and unlock
-   for (u64& pid : toEvict) {
+   for (auto& [pid, offset] : toEvict) {
       bool succ = residentSet.remove(pid);
       assert(succ);
+      freeOffset.push(offset);
       getPageState(pid).unlockXEvicted();
    }
 
@@ -1113,6 +1156,8 @@ struct BTreeNode : public BTreeNodeHeader {
       insertFence(upperFence, upper);
       for (prefixLen = 0; (prefixLen < min(lower.size(), upper.size())) && (lower[prefixLen] == upper[prefixLen]); prefixLen++)
          ;
+      assert((std::memcmp(lower.data(), upper.data(), std::min(lower.size(), upper.size())) <= 0) ||
+             (lower.size() <= upper.size()));
    }
 
    void splitNode(BTreeNode* parent, unsigned sepSlot, span<u8> sep)
@@ -1637,6 +1682,23 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
    }
    for (auto& t : threads)
       t.join();
+}
+
+auto pteSize() -> std::string {
+  auto pid = getpid();
+  std::ifstream proc_status(std::format("/proc/{}/status", pid).c_str());
+  std::string line;
+  while (true) {
+    std::getline(proc_status, line);
+    if (line.empty()) { break; }
+    if (line.starts_with("VmPTE:")) {
+      auto pos = line.rfind(" ");
+      assert(pos != line.npos);
+      pos = line.substr(0, pos).rfind(" ");
+      return line.substr(pos + 1);
+    }
+  }
+  return {};
 }
 
 int main(int argc, char** argv) {

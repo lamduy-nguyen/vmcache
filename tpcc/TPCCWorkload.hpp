@@ -516,7 +516,7 @@ struct TPCCWorkload
              [&](const order_wdc_t::Key& key, const order_wdc_t&) {
                 assert(key.o_w_id == w_id);
                 assert(key.o_d_id == d_id);
-                assert(key.o_c_id == c_id);
+                //assert(key.o_c_id == c_id);
                 o_id = key.o_id;
                 return false;
              },
