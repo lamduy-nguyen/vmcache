@@ -23,8 +23,6 @@
 #include <unistd.h>
 #include <immintrin.h>
 
-#include "exmap.h"
-
 __thread uint16_t workerThreadId = 0;
 __thread int32_t tpcchistorycounter = 0;
 #include "tpcc/TPCCWorkload.hpp"
@@ -43,7 +41,7 @@ struct alignas(4096) Page {
    bool dirty;
 };
 
-static const int16_t maxWorkerThreads = 256;
+static const int16_t maxWorkerThreads = 128;
 
 #define die(msg) do { perror(msg); exit(EXIT_FAILURE); } while(0)
 
@@ -51,12 +49,6 @@ uint64_t rdtsc() {
    uint32_t hi, lo;
    __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
    return static_cast<uint64_t>(lo)|(static_cast<uint64_t>(hi)<<32);
-}
-
-// exmap helper function
-static int exmapAction(int exmapfd, exmap_opcode op, u16 len) {
-   struct exmap_action_params params_free = { .interface = workerThreadId, .iov_len = len, .opcode = (u16)op, };
-   return ioctl(exmapfd, EXMAP_IOCTL_ACTION, &params_free);
 }
 
 // allocate memory using huge pages
@@ -225,7 +217,7 @@ struct ResidentPageSet {
 
 // libaio interface used to write batches of pages
 struct LibaioInterface {
-   static const u64 maxIOs = 256;
+   static const u64 maxIOs = 128;
 
    int blockfd;
    Page* virtMem;
@@ -272,12 +264,9 @@ struct BufferManager {
    u64 physSize;
    u64 virtCount;
    u64 physCount;
-   struct exmap_user_interface* exmapInterface[maxWorkerThreads];
    vector<LibaioInterface> libaioInterface;
 
-   bool useExmap;
    int blockfd;
-   int exmapfd;
 
    atomic<u64> physUsedCount;
    ResidentPageSet residentSet;
@@ -596,30 +585,8 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
    }
    u64 virtAllocSize = virtSize + (1<<16); // we allocate 64KB extra to prevent segfaults during optimistic reads
 
-   useExmap = envOr("EXMAP", 0);
-   if (useExmap) {
-      exmapfd = open("/dev/exmap", O_RDWR);
-      if (exmapfd < 0) die("open exmap");
-
-      struct exmap_ioctl_setup buffer;
-      buffer.fd             = blockfd;
-      buffer.max_interfaces = maxWorkerThreads;
-      buffer.buffer_size    = physCount;
-      buffer.flags          = 0;
-      if (ioctl(exmapfd, EXMAP_IOCTL_SETUP, &buffer) < 0)
-         die("ioctl: exmap_setup");
-
-      for (unsigned i=0; i<maxWorkerThreads; i++) {
-         exmapInterface[i] = (struct exmap_user_interface *) mmap(NULL, pageSize, PROT_READ|PROT_WRITE, MAP_SHARED, exmapfd, EXMAP_OFF_INTERFACE(i));
-         if (exmapInterface[i] == MAP_FAILED)
-            die("setup exmapInterface");
-      }
-
-      virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_SHARED, exmapfd, 0);
-   } else {
-      virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-      madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
-   }
+   virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+   madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
 
    pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
    for (u64 i=0; i<virtCount; i++)
@@ -637,7 +604,7 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
    writeCount = 0;
    batch = envOr("BATCH", 64);
 
-   cerr << "vmcache " << "blk:" << path << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << " exmap:" << useExmap << endl;
+   cerr << "vmcache " << "blk:" << path << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << endl;
 }
 
 void BufferManager::ensureFreePages() {
@@ -658,15 +625,6 @@ Page* BufferManager::allocPage() {
    bool succ = getPageState(pid).tryLockX(stateAndVersion);
    assert(succ);
    residentSet.insert(pid);
-
-   if (useExmap) {
-      exmapInterface[workerThreadId]->iov[0].page = pid;
-      exmapInterface[workerThreadId]->iov[0].len = 1;
-      while (exmapAction(exmapfd, EXMAP_OP_ALLOC, 1) < 0) {
-         cerr << "allocPage errno: " << errno << " pid: " << pid << " workerId: " << workerThreadId << endl;
-         ensureFreePages();
-      }
-   }
    virtMem[pid].dirty = true;
 
    return virtMem + pid;
@@ -733,22 +691,9 @@ void BufferManager::unfixX(PID pid) {
 }
 
 void BufferManager::readPage(PID pid) {
-   if (useExmap) {
-      for (u64 repeatCounter=0; ; repeatCounter++) {
-         int ret = pread(exmapfd, virtMem+pid, pageSize, workerThreadId);
-         if (ret == pageSize) {
-            assert(ret == pageSize);
-            readCount++;
-            return;
-         }
-         cerr << "readPage errno: " << errno << " pid: " << pid << " workerId: " << workerThreadId << endl;
-         ensureFreePages();
-      }
-   } else {
-      int ret = pread(blockfd, virtMem+pid, pageSize, pid*pageSize);
-      assert(ret==pageSize);
-      readCount++;
-   }
+   int ret = pread(blockfd, virtMem+pid, pageSize, pid*pageSize);
+   assert(ret==pageSize);
+   readCount++;
 }
 
 void BufferManager::evict() {
@@ -802,17 +747,8 @@ void BufferManager::evict() {
    }
 
    // 4. remove from page table
-   if (useExmap) {
-      for (u64 i=0; i<toEvict.size(); i++) {
-         exmapInterface[workerThreadId]->iov[i].page = toEvict[i];
-         exmapInterface[workerThreadId]->iov[i].len = 1;
-      }
-      if (exmapAction(exmapfd, EXMAP_OP_FREE, toEvict.size()) < 0)
-         die("ioctl: EXMAP_OP_FREE");
-   } else {
-      for (u64& pid : toEvict)
-         madvise(virtMem + pid, pageSize, MADV_DONTNEED);
-   }
+   for (u64& pid : toEvict)
+      madvise(virtMem + pid, pageSize, MADV_DONTNEED);
 
    // 5. remove from hash table and unlock
    for (u64& pid : toEvict) {
@@ -829,7 +765,7 @@ void BufferManager::evict() {
 struct BTreeNode;
 
 struct BTreeNodeHeader {
-   static const unsigned underFullSize = (pageSize/2) + (pageSize/4);  // merge nodes more empty
+   static const unsigned underFullSize = (pageSize/4);  // merge nodes more empty
    static const u64 noNeighbour = ~0ull;
 
    struct FenceKeySlot {
@@ -1704,16 +1640,6 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
 }
 
 int main(int argc, char** argv) {
-   if (bm.useExmap) {
-      struct sigaction action;
-      action.sa_flags = SA_SIGINFO;
-      action.sa_sigaction = handleSEGFAULT;
-      if (sigaction(SIGSEGV, &action, NULL) == -1) {
-         perror("sigusr: sigaction");
-         exit(1);
-      }
-   }
-
    unsigned nthreads = envOr("THREADS", 1);
    u64 n = envOr("DATASIZE", 10);
    u64 runForSec = envOr("RUNFOR", 30);
@@ -1722,7 +1648,7 @@ int main(int argc, char** argv) {
    u64 statDiff = 1e8;
    atomic<u64> txProgress(0);
    atomic<bool> keepRunning(true);
-   auto systemName = bm.useExmap ? "exmap" : "vmcache";
+   auto systemName = "vmcache";
 
    auto statFn = [&]() {
       cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;
